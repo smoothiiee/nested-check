@@ -1,0 +1,53 @@
+name: Check Linux KVM nested capabilities
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/linux-check.yml']
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect KVM and CPUID without launching a VM
+        shell: bash
+        run: |
+          set -eu
+          lscpu | grep -E 'Architecture:|Vendor ID:|Model name:|Virtualization:|Hypervisor vendor:' || true
+          for p in /sys/module/kvm_amd/parameters/nested /sys/module/kvm_intel/parameters/nested; do
+            if [ -r "$p" ]; then printf '%s: ' "$p"; cat "$p"; fi
+          done
+          cat > "$RUNNER_TEMP/probe.c" <<'EOF'
+          #include <cpuid.h>
+          #include <fcntl.h>
+          #include <linux/kvm.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/ioctl.h>
+          #include <unistd.h>
+          int main(void) {
+            unsigned a,b,c,d;
+            if (__get_cpuid(1,&a,&b,&c,&d)) printf("L1 VMX exposed: %u\n",(c>>5)&1);
+            if (__get_cpuid(0x80000001,&a,&b,&c,&d)) printf("L1 SVM exposed: %u\n",(c>>2)&1);
+            int fd=open("/dev/kvm",O_RDWR);
+            if(fd<0) { perror("KVM unavailable"); return 0; }
+            printf("KVM API version: %d\n",ioctl(fd,KVM_GET_API_VERSION,0));
+            struct kvm_cpuid2 *p=calloc(1,sizeof(*p)+256*sizeof(struct kvm_cpuid_entry2));
+            if(!p) { close(fd); return 1; }
+            p->nent=256;
+            if(ioctl(fd,KVM_GET_SUPPORTED_CPUID,p)<0) { perror("KVM CPUID query"); free(p); close(fd); return 1; }
+            unsigned svm=0,vmx=0,npt=0,nrip=0,asids=0;
+            for(unsigned i=0;i<p->nent;i++) {
+              struct kvm_cpuid_entry2 *e=&p->entries[i];
+              if(e->function==1) vmx=(e->ecx>>5)&1;
+              if(e->function==0x80000001) svm=(e->ecx>>2)&1;
+              if(e->function==0x8000000a) { npt=e->edx&1; nrip=(e->edx>>3)&1; asids=e->ebx; }
+            }
+            printf("KVM guest VMX: %u\nKVM guest SVM: %u\nKVM guest NPT: %u\nKVM guest nRIP: %u\nKVM guest ASIDs: %u\n",vmx,svm,npt,nrip,asids);
+            puts("Capability query only; no Windows guest or ResearchHV driver has run.");
+            free(p); close(fd); return 0;
+          }
+          EOF
+          gcc -Wall -Wextra -Werror "$RUNNER_TEMP/probe.c" -o "$RUNNER_TEMP/probe"
+          sudo "$RUNNER_TEMP/probe"
