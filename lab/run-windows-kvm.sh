@@ -4,11 +4,24 @@ task_lab="$RUNNER_TEMP/researchhv-windows"
 mkdir -p "$task_lab"
 cd "$task_lab"
 echo 'Read-only host capability preflight'
-if ! grep -qw vmx /proc/cpuinfo || [ ! -e /dev/kvm ]; then
-  echo 'This runner does not expose Intel VMX and KVM; stopping before download.'
+lscpu | grep -E 'Architecture:|Vendor ID:|Model name:|Virtualization:|Hypervisor vendor:' || true
+ls -l /dev/kvm || true
+task_cpu=''
+if grep -qw vmx /proc/cpuinfo; then
+  task_cpu='host,vmx=on'
+  task_nested='/sys/module/kvm_intel/parameters/nested'
+elif grep -qw svm /proc/cpuinfo; then
+  task_cpu='host,svm=on'
+  task_nested='/sys/module/kvm_amd/parameters/nested'
+else
+  echo 'This runner exposes neither VMX nor SVM; stopping before download.'
   exit 1
 fi
-cat /sys/module/kvm_intel/parameters/nested
+if [ ! -e /dev/kvm ] || [ ! -r "$task_nested" ] || ! grep -Eqi '^(Y|1)$' "$task_nested"; then
+  echo 'KVM or its nested capability is unavailable; stopping before download.'
+  exit 1
+fi
+cat "$task_nested"
 df -h .
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils libguestfs-tools gcc-mingw-w64-x86-64-posix
@@ -83,7 +96,7 @@ task_cleanup() {
 }
 trap task_cleanup EXIT
 sudo timeout --signal=TERM --kill-after=20s 1200s qemu-system-x86_64 \
-  -accel kvm -machine pc -cpu host,vmx=on -smp 2 -m 4096 \
+  -accel kvm -machine pc -cpu "$task_cpu" -smp 2 -m 4096 \
   -drive file=guest.qcow2,format=qcow2,if=ide,cache=writeback \
   -boot c -nic none -display none -monitor none \
   -serial "file:$task_lab/serial.log" -no-reboot >qemu.log 2>&1 &
@@ -114,6 +127,6 @@ result = next(json.loads(s.split('RESEARCHHV_RESULT ', 1)[1]) for s in lines if 
 print(json.dumps(result, indent=2))
 if not result.get('success'):
     raise SystemExit('Windows probe reported an error')
-if 'VMX exposed: 1' not in result.get('cpuid', []):
-    raise SystemExit('VMX is not exposed inside Windows')
+if not any(s in result.get('cpuid', []) for s in ('VMX exposed: 1', 'SVM exposed: 1')):
+    raise SystemExit('Neither VMX nor SVM is exposed inside Windows')
 PY
