@@ -1,0 +1,19 @@
+name: Boot Windows evaluation under KVM
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-kvm.yml'
+      - 'lab/**'
+permissions:
+  contents: read
+jobs:
+  windows-guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Boot isolated Windows guest and collect its probe
+        shell: bash
+        run: bash lab/run-windows-kvm.sh
