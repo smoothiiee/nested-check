@@ -1,0 +1,72 @@
+name: Check nested virtualization exposure
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nested-check.yml']
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Read CPU capabilities without loading a driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:RUNNER_TEMP
+          @'
+          #include <intrin.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(void) {
+              int r[4]; char vendor[13] = {0};
+              __cpuidex(r, 0, 0);
+              unsigned maxBasic = (unsigned)r[0];
+              memcpy(vendor, &r[1], 4); memcpy(vendor+4, &r[3], 4);
+              memcpy(vendor+8, &r[2], 4);
+              unsigned ecx1 = 0, extEcx = 0, rev = 0, asids = 0, features = 0;
+              if (maxBasic >= 1) { __cpuidex(r, 1, 0); ecx1 = (unsigned)r[2]; }
+              __cpuidex(r, (int)0x80000000u, 0);
+              unsigned maxExt = (unsigned)r[0];
+              if (maxExt >= 0x80000001u) {
+                  __cpuidex(r, (int)0x80000001u, 0); extEcx = (unsigned)r[2];
+              }
+              if (maxExt >= 0x8000000au) {
+                  __cpuidex(r, (int)0x8000000au, 0);
+                  rev = (unsigned)r[0]; asids = (unsigned)r[1]; features = (unsigned)r[3];
+              }
+              printf("CPU vendor: %s\nOuter hypervisor: %u\n", vendor, (ecx1 >> 31) & 1u);
+              printf("Intel VMX exposed: %u\nAMD SVM exposed: %u\n", (ecx1 >> 5) & 1u, (extEcx >> 2) & 1u);
+              printf("SVM revision: %u\nSVM ASIDs: %u\nNPT: %u\nnRIP: %u\n",
+                  rev & 255u, asids, features & 1u, (features >> 3) & 1u);
+              printf("Raw CPUID 80000001 ECX: %08x\nRaw CPUID 8000000A EDX: %08x\n", extEcx, features);
+              bool candidate = strcmp(vendor, "AuthenticAMD") == 0 &&
+                  (extEcx & 4u) && (features & 1u) && (features & 8u) && asids > 1;
+              printf("AMD CPUID prerequisites: %s\n", candidate ? "PRESENT" : "MISSING");
+              puts("CPUID only: this does not prove MSR access, VMRUN/VMXON, or driver compatibility.");
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath probe.cpp -Encoding ascii
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC x64 compiler not found' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          @"
+          @echo off
+          call "$vcvars" >nul
+          if errorlevel 1 exit /b 1
+          cl /nologo /W4 /WX /MT /EHsc probe.cpp /Fe:probe.exe
+          if errorlevel 1 exit /b 1
+          probe.exe
+          "@ | Set-Content -LiteralPath build-probe.cmd -Encoding ascii
+          & cmd.exe /d /c build-probe.cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Probe build or execution failed' }
+          try {
+            Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+              Select-Object VirtualizationBasedSecurityStatus | Format-List
+          } catch { Write-Output 'VBS status unavailable; no settings changed.' }
